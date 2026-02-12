@@ -11,6 +11,7 @@ IMAGE_NAME="micahflee/claudito:latest"
 WORK_DIR="/src"
 CONTAINER_HOME_DIR="/home/claudito"
 VOLUME_NAME="claudito-home"
+NO_CONFIG=false
 
 # Colors for output
 RED='\033[0;31m'
@@ -31,6 +32,222 @@ error() {
     echo -e "${RED}[claudito]${NC} $1" >&2
 }
 
+validate_volume() {
+    if [[ "$1" != *:* ]]; then
+        error "Invalid volume mount: '$1' (expected HOST_PATH:CONTAINER_PATH or HOST_PATH:CONTAINER_PATH:OPTIONS)"
+        exit 1
+    fi
+}
+
+# Trust store infrastructure
+trust_store_path() {
+    local store_dir="${HOME}/.config/claudito"
+    mkdir -p "$store_dir"
+    echo "$store_dir/trusted.json"
+}
+
+hash_file() {
+    local file="$1"
+    echo "sha256:$(openssl dgst -sha256 "$file" | awk '{print $NF}')"
+}
+
+get_trusted_hash() {
+    local dir_path="$1"
+    local store
+    store="$(trust_store_path)"
+    if [[ ! -f "$store" ]]; then
+        echo ""
+        return
+    fi
+    jq -r --arg key "$dir_path" '.[$key].hash // empty' "$store"
+}
+
+set_trusted() {
+    local dir_path="$1"
+    local hash="$2"
+    local store
+    store="$(trust_store_path)"
+    local timestamp
+    timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ ! -f "$store" ]]; then
+        echo '{}' > "$store"
+    fi
+    local tmp
+    tmp="$(mktemp)"
+    jq --arg key "$dir_path" --arg hash "$hash" --arg ts "$timestamp" \
+        '.[$key] = {"hash": $hash, "trusted_at": $ts}' "$store" > "$tmp" && mv "$tmp" "$store"
+}
+
+remove_trusted() {
+    local dir_path="$1"
+    local store
+    store="$(trust_store_path)"
+    if [[ ! -f "$store" ]]; then
+        return
+    fi
+    local tmp
+    tmp="$(mktemp)"
+    jq --arg key "$dir_path" 'del(.[$key])' "$store" > "$tmp" && mv "$tmp" "$store"
+}
+
+list_trusted() {
+    local store
+    store="$(trust_store_path)"
+    if [[ ! -f "$store" ]] || [[ "$(jq 'length' "$store")" == "0" ]]; then
+        echo "No trusted directories."
+        return
+    fi
+    jq -r 'to_entries[] | "\(.key)\n  trusted_at: \(.value.trusted_at)\n  hash:       \(.value.hash)\n"' "$store"
+}
+
+# Display config summary for trust prompts
+show_config_summary() {
+    local config_file="$1"
+    local img vol args
+    img=$(jq -r '.image // empty' "$config_file")
+    vol=$(jq -r '(.volumes // []) | join(", ")' "$config_file")
+    args=$(jq -r '(.claude_args // []) | join(" ")' "$config_file")
+    echo ""
+    echo "  image:       ${img:-(default)}"
+    echo "  volumes:     ${vol:-(none)}"
+    echo "  claude_args: ${args:-(none)}"
+    echo ""
+}
+
+prompt_trust() {
+    local config_file="$1"
+    if [[ ! -t 0 ]]; then
+        warn ".clauditorc found but not trusted and no TTY available. Skipping config."
+        return 1
+    fi
+    info ".clauditorc found (not yet trusted):"
+    show_config_summary "$config_file"
+    local answer
+    read -r -p "Trust this configuration? [y/N] " answer < /dev/tty
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+prompt_retrust() {
+    local config_file="$1"
+    if [[ ! -t 0 ]]; then
+        warn ".clauditorc has changed but no TTY available. Skipping config."
+        return 1
+    fi
+    info ".clauditorc has changed since last trusted:"
+    show_config_summary "$config_file"
+    local answer
+    read -r -p "Trust updated configuration? [y/N] " answer < /dev/tty
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+# Pre-scan for --no-config (must be checked before config loading)
+for arg in "$@"; do
+    if [[ "$arg" == "--no-config" ]]; then
+        NO_CONFIG=true
+        break
+    fi
+    # Stop scanning at -- separator
+    if [[ "$arg" == "--" ]]; then
+        break
+    fi
+done
+
+# Handle subcommands (trust, untrust) before option parsing
+case "${1:-}" in
+    trust)
+        if [[ "${2:-}" == "--list" ]]; then
+            list_trusted
+            exit 0
+        fi
+        if [[ ! -f ".clauditorc" ]]; then
+            error "No .clauditorc file found in the current directory."
+            exit 1
+        fi
+        if ! command -v jq &> /dev/null; then
+            error "'jq' is required for .clauditorc support. Please install jq."
+            exit 1
+        fi
+        if ! jq empty .clauditorc; then
+            error ".clauditorc contains invalid JSON."
+            exit 1
+        fi
+        local_hash="$(hash_file .clauditorc)"
+        set_trusted "$(pwd)" "$local_hash"
+        info "Configuration trusted for $(pwd)"
+        exit 0
+        ;;
+    untrust)
+        remove_trusted "$(pwd)"
+        info "Trust removed for $(pwd)"
+        exit 0
+        ;;
+esac
+
+# Load project configuration from .clauditorc (JSON format) with trust verification
+CONFIG_VOLUMES=()
+CONFIG_CLAUDE_ARGS=()
+CONFIG_HAS_IMAGE=false
+CONFIG_TRUSTED=false
+if [[ "$NO_CONFIG" == true ]]; then
+    : # --no-config: skip .clauditorc entirely
+elif [[ -f ".clauditorc" ]]; then
+    if ! command -v jq &> /dev/null; then
+        error ".clauditorc found but 'jq' is not installed. Install jq to use project configuration, or pass --no-config to skip it."
+        exit 1
+    else
+        # Validate JSON before proceeding
+        if ! jq empty .clauditorc; then
+            error ".clauditorc contains invalid JSON."
+            exit 1
+        fi
+
+        # Check trust status
+        current_hash="$(hash_file .clauditorc)"
+        trusted_hash="$(get_trusted_hash "$(pwd)")"
+
+        if [[ -z "$trusted_hash" ]]; then
+            # Not in trust store — prompt to trust
+            if prompt_trust .clauditorc; then
+                set_trusted "$(pwd)" "$current_hash"
+                info "Configuration trusted."
+                CONFIG_TRUSTED=true
+            else
+                warn "Skipping .clauditorc. Running with defaults."
+            fi
+        elif [[ "$current_hash" != "$trusted_hash" ]]; then
+            # Hash differs — prompt to re-trust
+            if prompt_retrust .clauditorc; then
+                set_trusted "$(pwd)" "$current_hash"
+                info "Configuration trusted."
+                CONFIG_TRUSTED=true
+            else
+                warn "Skipping .clauditorc. Running with defaults."
+            fi
+        else
+            # Hash matches — trusted
+            CONFIG_TRUSTED=true
+        fi
+
+        # Only load config if trusted
+        if [[ "$CONFIG_TRUSTED" == true ]]; then
+            CONFIG_IMAGE=$(jq -r '.image // empty' .clauditorc)
+            if [[ -n "$CONFIG_IMAGE" ]]; then
+                IMAGE_NAME="$CONFIG_IMAGE"
+                CONFIG_HAS_IMAGE=true
+            fi
+
+            while IFS= read -r vol; do
+                validate_volume "$vol"
+                CONFIG_VOLUMES+=("-v" "$vol")
+            done < <(jq -r '(.volumes // [])[]' .clauditorc)
+
+            while IFS= read -r arg; do
+                CONFIG_CLAUDE_ARGS+=("$arg")
+            done < <(jq -r '(.claude_args // [])[]' .clauditorc)
+        fi
+    fi
+fi
+
 # Parse claudito-specific arguments
 ADDITIONAL_VOLUMES=()
 CLAUDE_ARGS=()
@@ -41,11 +258,29 @@ while [[ $# -gt 0 ]]; do
             echo "claudito version $VERSION"
             exit 0
             ;;
+        --image)
+            if [[ -z "$2" ]]; then
+                error "Error: --image requires an argument (e.g., --image my-claudito:latest)"
+                exit 1
+            fi
+            if [[ "$CONFIG_HAS_IMAGE" == true ]]; then
+                error "Error: --image conflicts with 'image' in .clauditorc"
+                error "Set the image in .clauditorc or on the command line, not both."
+                exit 1
+            fi
+            IMAGE_NAME="$2"
+            shift 2
+            ;;
+        --no-config)
+            NO_CONFIG=true
+            shift
+            ;;
         --volume|-V)
             if [[ -z "$2" ]]; then
                 error "Error: --volume requires an argument (format: HOST_PATH:CONTAINER_PATH or HOST_PATH:CONTAINER_PATH:OPTIONS)"
                 exit 1
             fi
+            validate_volume "$2"
             ADDITIONAL_VOLUMES+=("-v" "$2")
             shift 2
             ;;
@@ -53,15 +288,47 @@ while [[ $# -gt 0 ]]; do
             echo "Claudito - Docker wrapper for Claude Code"
             echo ""
             echo "Usage: claudito [OPTIONS] [CLAUDE_ARGS...]"
+            echo "       claudito <SUBCOMMAND>"
             echo ""
             echo "Claudito Options:"
             echo "  -h, --help              Show this help message"
             echo "  -v, --version           Show claudito version"
+            echo "  --image IMAGE           Use a custom Docker image (must be based on micahflee/claudito)"
+            echo "                          Example: --image my-claudito:latest"
             echo "  -V, --volume HOST:CONTAINER[:OPTIONS]"
             echo "                          Mount additional volume (can be used multiple times)"
             echo "                          Example: --volume /host/data:/container/data:ro"
+            echo "  --no-config             Ignore .clauditorc even if present"
+            echo ""
+            echo "Subcommands:"
+            echo "  trust                   Trust the .clauditorc in the current directory"
+            echo "  trust --list            List all trusted directories"
+            echo "  untrust                 Remove trust for the current directory"
             echo ""
             echo "All other arguments are passed to Claude Code in the container."
+            echo ""
+            echo "Project Configuration:"
+            echo "  Place a .clauditorc file (JSON) in your project root to set defaults:"
+            echo ""
+            echo "    {"
+            echo "      \"image\": \"my-claudito:latest\","
+            echo "      \"volumes\": [\"/host/data:/container/data:ro\"],"
+            echo "      \"claude_args\": [\"--verbose\", \"--model=opus\"]"
+            echo "    }"
+            echo ""
+            echo "  Supported keys:"
+            echo "    image        Docker image (cannot also use --image on CLI)"
+            echo "    volumes      Additional volume mounts (combined with -V on CLI)"
+            echo "    claude_args  Arguments passed to Claude Code (prepended to CLI args)"
+            echo ""
+            echo "  Requires 'jq' to be installed."
+            echo ""
+            echo "  Trust model: The first time claudito encounters a .clauditorc, it prompts"
+            echo "  you to review and trust the configuration. If the file changes, you will"
+            echo "  be prompted again. Trust state is stored per-user at:"
+            echo "    ~/.config/claudito/trusted.json"
+            echo ""
+            echo "  Use 'claudito trust' to pre-trust a config without being prompted."
             exit 0
             ;;
         --)
@@ -77,6 +344,10 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Merge .clauditorc settings with CLI arguments
+ADDITIONAL_VOLUMES=("${CONFIG_VOLUMES[@]}" "${ADDITIONAL_VOLUMES[@]}")
+CLAUDE_ARGS=("${CONFIG_CLAUDE_ARGS[@]}" "${CLAUDE_ARGS[@]}")
 
 # Display version
 info "Claudito version $VERSION"
@@ -95,9 +366,24 @@ if ! docker info &> /dev/null; then
     exit 1
 fi
 
-# Pull latest image
-info "Pulling latest $IMAGE_NAME image..."
-docker pull "$IMAGE_NAME"
+# Pull the image
+# For the default image, always pull to get the latest version.
+# For custom images, use the local copy if available; only pull if not found locally.
+if [[ "$IMAGE_NAME" == "micahflee/claudito:"* || "$IMAGE_NAME" == "micahflee/claudito" ]]; then
+    info "Pulling latest $IMAGE_NAME image..."
+    docker pull "$IMAGE_NAME"
+else
+    if docker image inspect "$IMAGE_NAME" &> /dev/null; then
+        info "Using local image: $IMAGE_NAME"
+    else
+        info "Image not found locally, pulling $IMAGE_NAME..."
+        if ! docker pull "$IMAGE_NAME"; then
+            error "Image '$IMAGE_NAME' not found locally or on a registry."
+            error "Build it locally (docker build -t $IMAGE_NAME .) or push it to a registry first."
+            exit 1
+        fi
+    fi
+fi
 
 # Get the current directory
 CURRENT_DIR="$(pwd)"
