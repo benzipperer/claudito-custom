@@ -17,6 +17,7 @@ NO_CONFIG=false
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BOLD='\033[1m'
 NC='\033[0m' # No Color
 
 # Function to print colored messages
@@ -106,11 +107,19 @@ show_config_summary() {
     local img vol args
     img=$(jq -r '.image // empty' "$config_file")
     vol=$(jq -r '(.volumes // []) | join(", ")' "$config_file")
-    args=$(jq -r '(.claude_args // []) | join(" ")' "$config_file")
+    local formatted_args=""
+    while IFS= read -r arg; do
+        if [[ "$arg" == *skip-permissions* ]]; then
+            formatted_args+="${YELLOW}${BOLD}⚠ ${arg} ⚠${NC} "
+        else
+            formatted_args+="$arg "
+        fi
+    done < <(jq -r '(.claude_args // [])[]' "$config_file")
+    formatted_args="${formatted_args:-(none)}"
     echo ""
     echo "  image:       ${img:-(default)}"
     echo "  volumes:     ${vol:-(none)}"
-    echo "  claude_args: ${args:-(none)}"
+    echo -e "  claude_args: ${formatted_args}"
     echo ""
 }
 
@@ -185,6 +194,7 @@ esac
 
 # Load project configuration from .clauditorc (JSON format) with trust verification
 CONFIG_VOLUMES=()
+CONFIG_VOLUME_SPECS=()
 CONFIG_CLAUDE_ARGS=()
 CONFIG_HAS_IMAGE=false
 CONFIG_TRUSTED=false
@@ -239,6 +249,7 @@ elif [[ -f ".clauditorc" ]]; then
             while IFS= read -r vol; do
                 validate_volume "$vol"
                 CONFIG_VOLUMES+=("-v" "$vol")
+                CONFIG_VOLUME_SPECS+=("$vol")
             done < <(jq -r '(.volumes // [])[]' .clauditorc)
 
             while IFS= read -r arg; do
@@ -250,6 +261,7 @@ fi
 
 # Parse claudito-specific arguments
 ADDITIONAL_VOLUMES=()
+CLI_VOLUME_SPECS=()
 CLAUDE_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -282,6 +294,7 @@ while [[ $# -gt 0 ]]; do
             fi
             validate_volume "$2"
             ADDITIONAL_VOLUMES+=("-v" "$2")
+            CLI_VOLUME_SPECS+=("$2")
             shift 2
             ;;
         --help|-h)
@@ -388,7 +401,29 @@ fi
 # Get the current directory
 CURRENT_DIR="$(pwd)"
 
-# Run the container with security restrictions
+# Display launch summary
+if [[ ${#CONFIG_VOLUME_SPECS[@]} -gt 0 || ${#CLI_VOLUME_SPECS[@]} -gt 0 ]]; then
+    info "Extra volumes:"
+    for spec in "${CONFIG_VOLUME_SPECS[@]}"; do
+        info "  $spec (from .clauditorc)"
+    done
+    for spec in "${CLI_VOLUME_SPECS[@]}"; do
+        info "  $spec (from --volume)"
+    done
+fi
+
+if [[ ${#CLAUDE_ARGS[@]} -gt 0 ]]; then
+    formatted_args=""
+    for arg in "${CLAUDE_ARGS[@]}"; do
+        if [[ "$arg" == *skip-permissions* ]]; then
+            formatted_args+="${YELLOW}${BOLD}⚠ ${arg} ⚠${NC} "
+        else
+            formatted_args+="$arg "
+        fi
+    done
+    info "Claude args: $formatted_args"
+fi
+
 info "Starting Claude Code in container..."
 exec docker run \
     --rm \
