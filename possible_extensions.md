@@ -95,3 +95,58 @@ Docker's `--network=none` is trivial. The `api-only` mode is more involved. Opti
 - The wrapper should validate the `--network` value and error on unrecognized modes.
 - `api-only` is a meaningful project on its own and should not block shipping `full`/`none`.
 - Consider that `--network=none` also blocks the agent from authenticating with Anthropic if credentials aren't already cached in the config volume. The launch notice should mention this.
+
+## 3. Resource Limits
+
+### Problem
+
+The container currently runs with no CPU, memory, or time constraints. A runaway agent — or simply a large `npm install` / compilation — can consume all host resources, freeze the machine, or fill the disk. This is especially relevant when the agent has full autonomy (dangerously-skip-permissions) and may kick off expensive operations without user intervention.
+
+### Limits to expose
+
+Three categories, all mapping directly to existing Docker flags:
+
+1. **Memory**: `--memory` flag, passed through to Docker's `--memory`. Caps the container's RAM usage. When exceeded, the OOM killer terminates the process rather than swapping the host to death.
+
+2. **CPU**: `--cpus` flag, passed through to Docker's `--cpus`. Limits how many CPU cores the container can use. Prevents the agent from saturating all cores during builds or tests.
+
+3. **Timeout**: `--timeout` flag, implemented in the wrapper script. Kills the container after N minutes. Useful for unattended runs, CI pipelines, or just a safety net against sessions that run indefinitely.
+
+### Behavior
+
+- **All disabled by default** (preserves current behavior).
+- Configurable via CLI flags or `.clauditorc` keys (`"memory"`, `"cpus"`, `"timeout"`).
+- CLI flags override `.clauditorc` values.
+- When limits are active, print them at launch so the user knows what constraints are in effect.
+
+### CLI flags
+
+- `--memory=<limit>` — Container memory limit (e.g., `4g`, `512m`). Passed directly to `docker run --memory`.
+- `--cpus=<count>` — CPU core limit (e.g., `2`, `0.5`). Passed directly to `docker run --cpus`.
+- `--timeout=<minutes>` — Kill the container after this many minutes.
+
+### `.clauditorc` example
+
+```json
+{
+  "memory": "4g",
+  "cpus": 2,
+  "timeout": 60
+}
+```
+
+### Timeout implementation
+
+The timeout cannot be a Docker flag — Docker doesn't have a native run timeout. Two approaches:
+
+- **Background timer in the wrapper**: After `docker run`, the wrapper's PID is replaced via `exec`. Instead, the wrapper could spawn `docker run` as a child process, start a background timer with `timeout` or a subshell (`sleep N && docker kill`), and wait. This changes the current `exec docker run` pattern but is straightforward.
+- **Entrypoint-based timer**: The entrypoint script starts a background `sleep` and then execs Claude. When the sleep expires, it sends SIGTERM. Simpler to implement but the timer runs inside the container where the agent could theoretically kill it.
+
+The wrapper-based approach is more robust since the timer runs on the host, outside the agent's reach.
+
+### Implementation notes
+
+- `--memory` and `--cpus` are each a single argument appended to the `docker run` invocation. Minimal code change.
+- The wrapper should validate formats (e.g., memory must match Docker's syntax like `512m`, `2g`; cpus must be a positive number).
+- Timeout is the most complex piece due to replacing the `exec` pattern. Consider implementing memory/cpu first and timeout as a follow-up.
+- When a timeout kills the container, print a clear message: `Session terminated after N minutes (--timeout).`
