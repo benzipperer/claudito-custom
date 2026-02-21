@@ -150,3 +150,70 @@ The wrapper-based approach is more robust since the timer runs on the host, outs
 - The wrapper should validate formats (e.g., memory must match Docker's syntax like `512m`, `2g`; cpus must be a positive number).
 - Timeout is the most complex piece due to replacing the `exec` pattern. Consider implementing memory/cpu first and timeout as a follow-up.
 - When a timeout kills the container, print a clear message: `Session terminated after N minutes (--timeout).`
+
+## 4. Environment Variable and File Passthrough
+
+### Problem
+
+There's no mechanism to inject environment variables or configuration files into the container. Users frequently need API keys, database URLs, language-specific config files (`.Renviron`, `.env`), or feature flags available inside the container. Currently, the only workaround is mounting files manually with `--volume`, which requires knowing the correct container path.
+
+### Two distinct needs
+
+This feature actually covers two different things that look similar but behave differently:
+
+1. **Environment variables in the container** — Real env vars visible to every process. Useful for API keys, config values, and anything the agent or its subprocesses might need. Docker supports this natively via `-e KEY=VALUE` and `--env-file`.
+
+2. **Configuration files mounted at specific paths** — Some tools read their own config files from specific locations (e.g., R reads `~/.Renviron`, Python reads `.env` via dotenv, Node reads `.npmrc`). These need to exist as files inside the container, not just as env vars.
+
+### Example: `.Renviron`
+
+`.Renviron` illustrates the ambiguity. It's a file with `KEY=VALUE` lines that R reads at startup. A user could want either:
+
+- **Mount the file** so R specifically reads it: `--volume ~/.Renviron:/home/claudito/.Renviron:ro`. Only R sees these values.
+- **Parse it as env vars** so every process sees them: `--env-file .Renviron`. Docker's `--env-file` format is compatible with `.Renviron` (both use `KEY=VALUE` with `#` comments). But now the values are exposed to all processes, not just R.
+
+The right choice depends on the user's intent, and claudito shouldn't assume.
+
+### Possible CLI surface
+
+```bash
+# Pass individual env vars
+claudito --env API_KEY=sk-123 --env DEBUG=true
+
+# Pass an env file (Docker --env-file format: KEY=VALUE lines, # comments)
+claudito --env-file .env
+
+# Forward specific host env vars into the container
+claudito --forward-env API_KEY,DATABASE_URL
+```
+
+File mounting is already handled by `--volume` but the UX is rough for common cases. A shorthand could help but risks scope creep (see open questions below).
+
+### `.clauditorc` support
+
+```json
+{
+  "env": {
+    "DEBUG": "true",
+    "NODE_ENV": "development"
+  },
+  "env_file": ".env"
+}
+```
+
+### Open questions
+
+1. **`--env-file` vs file mounting**: Should claudito offer both, or just `--env-file` (real env vars) and let `--volume` handle file mounting? Adding a file-mount shorthand (e.g., `--config ~/.Renviron`) introduces questions about target paths, naming conventions, and scope creep.
+
+2. **Trust implications**: If `.clauditorc` specifies `"env_file": ".env"`, that file gets loaded automatically when the user trusts the config. This could be a vector for leaking secrets — a malicious `.clauditorc` committed to a shared repo could silently inject env vars from a file the user didn't intend to expose. Should `env_file` be excluded from `.clauditorc` and only allowed via CLI? Or should the trust prompt explicitly list which env file will be loaded?
+
+3. **`--forward-env` ergonomics**: Forwarding host env vars is convenient but blurs the isolation boundary. Should it require explicit opt-in per variable (safer), or support wildcards like `--forward-env "AWS_*"` (more convenient, riskier)?
+
+4. **Overlap with `--volume`**: Mounting `.Renviron` at `/home/claudito/.Renviron:ro` already works today. Is the friction high enough to justify a dedicated feature, or is better documentation of the `--volume` approach sufficient?
+
+### Implementation notes
+
+- `--env` and `--env-file` map directly to Docker's `-e` and `--env-file` flags. Minimal wrapper code.
+- `--forward-env` would read the named variables from the host environment and pass them via `-e`.
+- The trust system already displays config summaries when prompting. If `env_file` is allowed in `.clauditorc`, the trust prompt should show the file path and ideally the variable names (not values) it contains.
+- Start with `--env` and `--env-file` CLI flags only. Defer `.clauditorc` integration until the trust implications are resolved.
