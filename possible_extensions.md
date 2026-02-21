@@ -217,3 +217,71 @@ File mounting is already handled by `--volume` but the UX is rough for common ca
 - `--forward-env` would read the named variables from the host environment and pass them via `-e`.
 - The trust system already displays config summaries when prompting. If `env_file` is allowed in `.clauditorc`, the trust prompt should show the file path and ideally the variable names (not values) it contains.
 - Start with `--env` and `--env-file` CLI flags only. Defer `.clauditorc` integration until the trust implications are resolved.
+
+## 5. Pre-Launch Setup Commands
+
+### Problem
+
+Most real projects require setup before the agent can be productive — `npm install`, `pip install -r requirements.txt`, `bundle install`, `apt install golang-go`, etc. Currently the user has two options, both with friction:
+
+1. **Build a custom Docker image** with the dependencies baked in. Works but requires maintaining a Dockerfile per project and rebuilding when dependencies change.
+2. **Let the agent do it** on every session. Wastes time and API tokens as the agent rediscovers and reinstalls the same dependencies each run.
+
+Neither is great for the common case: a project with a `package.json` or `requirements.txt` that just needs a one-liner before the agent starts.
+
+### Approach
+
+Allow setup commands to run inside the container after it starts but before Claude launches. The entrypoint script would execute these commands sequentially, and only start Claude if they all succeed.
+
+### `.clauditorc` support
+
+```json
+{
+  "setup": [
+    "npm install",
+    "pip install -r requirements.txt"
+  ]
+}
+```
+
+The setup commands run as the `claudito` user inside the container, with access to the mounted source directory at `/src`. They have sudo available for system-level installs like `sudo apt install -y golang-go`.
+
+### CLI support
+
+```bash
+# One-off setup command
+claudito --setup "npm install"
+
+# Multiple setup commands
+claudito --setup "sudo apt install -y golang-go" --setup "go mod download"
+```
+
+CLI `--setup` commands run after `.clauditorc` setup commands (if both are present).
+
+### Behavior
+
+- Setup commands run sequentially in order.
+- If any setup command fails (non-zero exit), claudito prints the error and aborts — it does not launch Claude. This prevents the agent from starting in a broken environment.
+- Setup output is printed to the terminal so the user can see progress (dependency installs can be slow).
+- Setup runs every time the container starts. Since the container is ephemeral, there's no caching between sessions — `npm install` runs fresh each time.
+
+### Caching consideration
+
+The "runs every time" behavior is the main downside. For large projects, `npm install` can take minutes. Possible mitigations:
+
+- **Volume-mount the cache directory**: Mount `node_modules`, `.venv`, or other dependency directories as named Docker volumes so they persist across sessions. This could be a `.clauditorc` pattern: combine `"volumes"` with `"setup"` so the install is fast on repeat runs.
+- **Layer caching via custom image**: For teams, the recommended path for heavy setup is still a custom image. Setup commands are for lightweight, per-project needs.
+- **Conditional setup**: A future refinement could skip setup if a marker file exists (e.g., `node_modules/.claudito-setup-done`), but this adds complexity and staleness risks.
+
+### Trust implications
+
+Setup commands in `.clauditorc` are covered by the existing trust system — the user must trust the config before it takes effect, and the trust prompt already shows a config summary. The summary should include the setup commands so the user sees exactly what will run.
+
+A malicious `.clauditorc` could include destructive setup commands (`rm -rf /src/*`), but this is no worse than the agent itself having write access. The trust prompt is the gate.
+
+### Implementation notes
+
+- The entrypoint script (`entrypoint.sh`) would need to accept and execute setup commands before `exec claude "$@"`. This could be done via an environment variable (e.g., `CLAUDITO_SETUP`) that the wrapper sets, containing the commands as a newline-delimited string or a JSON array.
+- Alternatively, mount a setup script file into the container and have the entrypoint source it.
+- The wrapper already constructs the `docker run` invocation, so injecting `-e CLAUDITO_SETUP=...` is straightforward.
+- Keep setup output visible (don't redirect to /dev/null) — users need to see install failures.
