@@ -218,7 +218,65 @@ File mounting is already handled by `--volume` but the UX is rough for common ca
 - The trust system already displays config summaries when prompting. If `env_file` is allowed in `.clauditorc`, the trust prompt should show the file path and ideally the variable names (not values) it contains.
 - Start with `--env` and `--env-file` CLI flags only. Defer `.clauditorc` integration until the trust implications are resolved.
 
-## 5. Pre-Launch Setup Commands
+## 5. Global User Configuration
+
+### Problem
+
+There's no way to set personal defaults that apply to all projects. Users who always want the same image, common volume mounts, or default Claude args must either repeat them on every CLI invocation or add a `.clauditorc` to every project. This is especially tedious for settings that are inherently user-specific rather than project-specific (e.g., a preferred model, a personal API key volume mount).
+
+### Approach
+
+Add a global config file at `~/.config/claudito/config.json`, following XDG Base Directory conventions. This file uses the same JSON format as `.clauditorc` and is loaded before the project config. Project-level `.clauditorc` overrides the global config where there's a conflict.
+
+### Why these paths
+
+**Global: `~/.config/claudito/config.json`**
+
+The XDG `~/.config/<app>/` pattern is the modern standard for user-level config. Claudito already stores trust state at `~/.config/claudito/trusted.json`, so a global config file lives alongside it naturally. Newer CLI tools that support global config — gh, pip, Ruff, RuboCop — all use XDG paths.
+
+**Project: `.clauditorc` (unchanged)**
+
+A survey of tools that support both global and project-level config shows a clear pattern: when the project config is a single file, it's almost always a dotfile in the project root — `.npmrc`, `.rubocop.yml`, `.editorconfig`, `.ruff.toml`, `.prettierrc`. Tools that use a dot-directory for project config (`.git/config`, `.cargo/config.toml`, `.claude/settings.json`) do so because they store multiple files (hooks, state, caches, commands). `.clauditorc` is a single file, so a dotfile in the root is the right convention. Renaming to `.claudito/config.json` would follow a pattern meant for multi-file bundles and would break existing setups for no functional gain.
+
+### Merge semantics
+
+- **`image`**: Project wins if set, otherwise global.
+- **`volumes`**: Concatenated (global + project + CLI). Volumes are additive — a user might always mount their SSH keys globally while a project adds its own data directory.
+- **`claude_args`**: Concatenated (global + project + CLI), in that order. This matches how the wrapper already merges `.clauditorc` args with CLI args.
+- **`setup`**: Concatenated (global + project + CLI). Global setup runs first (e.g., always install a personal tool), then project setup.
+- **Other scalar keys** (e.g., `network`, `memory`, `cpus`, `timeout`): Project wins if set, otherwise global. CLI flags override both.
+
+### Trust model
+
+The global config does not need a trust prompt. It lives in a user-owned directory (`~/.config/claudito/`), is written by the user themselves, and is not sourced from untrusted repositories. This matches how every other tool handles global config — git doesn't prompt you to trust `~/.gitconfig`, npm doesn't prompt for `~/.npmrc`.
+
+### `--no-config` behavior
+
+The existing `--no-config` flag should skip both global and project config. For cases where users want fine-grained control:
+
+- `--no-config` — Skip all config (global and project)
+- `--no-project-config` — Skip `.clauditorc` only, still load global
+
+Adding `--no-global-config` is possible but likely over-engineering it — if a user wants to ignore their own global config, they can just not have one.
+
+### Example global config
+
+```json
+{
+  "volumes": ["/home/user/.ssh:/home/claudito/.ssh:ro"],
+  "claude_args": ["--model", "opus"]
+}
+```
+
+### Implementation notes
+
+- Load global config early in the wrapper, before `.clauditorc` processing.
+- Use `$XDG_CONFIG_HOME/claudito/config.json` if `$XDG_CONFIG_HOME` is set, otherwise `~/.config/claudito/config.json`.
+- No JSON validation prompt needed — just validate and error if malformed, same as `.clauditorc`.
+- The launch summary should indicate where each setting came from (global, project, CLI) so users can debug unexpected behavior.
+- Minimal code: the config loading logic already exists for `.clauditorc` and can be reused with a different file path and without the trust checks.
+
+## 6. Pre-Launch Setup Commands
 
 ### Problem
 
