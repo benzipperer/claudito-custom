@@ -6,12 +6,13 @@
 set -e
 
 # Configuration
-VERSION="0.1"
+VERSION="0.1.2"
 IMAGE_NAME="micahflee/claudito:latest"
 WORK_DIR="/src"
 CONTAINER_HOME_DIR="/home/claudito"
 VOLUME_NAME="claudito-home"
 NO_CONFIG=false
+NO_PROJECT_CONFIG=false
 
 # Colors for output
 RED='\033[0;31m'
@@ -149,11 +150,51 @@ prompt_retrust() {
     [[ "$answer" =~ ^[Yy]$ ]]
 }
 
-# Pre-scan for --no-config (must be checked before config loading)
+# Load global configuration (no trust needed — user's own config dir)
+load_global_config() {
+    local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/claudito"
+    local config_file="$config_dir/config.json"
+
+    GLOBAL_IMAGE=""
+    GLOBAL_VOLUMES=()
+    GLOBAL_VOLUME_SPECS=()
+    GLOBAL_CLAUDE_ARGS=()
+
+    if [[ ! -f "$config_file" ]]; then
+        return
+    fi
+
+    if ! command -v jq &> /dev/null; then
+        error "Global config found at $config_file but 'jq' is not installed."
+        exit 1
+    fi
+
+    if ! jq empty "$config_file"; then
+        error "Global config at $config_file contains invalid JSON."
+        exit 1
+    fi
+
+    GLOBAL_IMAGE=$(jq -r '.image // empty' "$config_file")
+
+    while IFS= read -r vol; do
+        validate_volume "$vol"
+        GLOBAL_VOLUMES+=("-v" "$vol")
+        GLOBAL_VOLUME_SPECS+=("$vol")
+    done < <(jq -r '(.volumes // [])[]' "$config_file")
+
+    while IFS= read -r arg; do
+        GLOBAL_CLAUDE_ARGS+=("$arg")
+    done < <(jq -r '(.claude_args // [])[]' "$config_file")
+}
+
+# Pre-scan for --no-config and --no-project-config (must be checked before config loading)
 for arg in "$@"; do
     if [[ "$arg" == "--no-config" ]]; then
         NO_CONFIG=true
         break
+    fi
+    if [[ "$arg" == "--no-project-config" ]]; then
+        NO_PROJECT_CONFIG=true
     fi
     # Stop scanning at -- separator
     if [[ "$arg" == "--" ]]; then
@@ -192,14 +233,28 @@ case "${1:-}" in
         ;;
 esac
 
+# Load global config unless --no-config
+GLOBAL_IMAGE=""
+GLOBAL_VOLUMES=()
+GLOBAL_VOLUME_SPECS=()
+GLOBAL_CLAUDE_ARGS=()
+IMAGE_SOURCE="default"
+
+if [[ "$NO_CONFIG" != true ]]; then
+    load_global_config
+    if [[ -n "$GLOBAL_IMAGE" ]]; then
+        IMAGE_NAME="$GLOBAL_IMAGE"
+        IMAGE_SOURCE="global"
+    fi
+fi
+
 # Load project configuration from .clauditorc (JSON format) with trust verification
-CONFIG_VOLUMES=()
-CONFIG_VOLUME_SPECS=()
-CONFIG_CLAUDE_ARGS=()
-CONFIG_HAS_IMAGE=false
-CONFIG_TRUSTED=false
-if [[ "$NO_CONFIG" == true ]]; then
-    : # --no-config: skip .clauditorc entirely
+PROJECT_VOLUMES=()
+PROJECT_VOLUME_SPECS=()
+PROJECT_CLAUDE_ARGS=()
+PROJECT_TRUSTED=false
+if [[ "$NO_CONFIG" == true || "$NO_PROJECT_CONFIG" == true ]]; then
+    : # --no-config or --no-project-config: skip .clauditorc
 elif [[ -f ".clauditorc" ]]; then
     if ! command -v jq &> /dev/null; then
         error ".clauditorc found but 'jq' is not installed. Install jq to use project configuration, or pass --no-config to skip it."
@@ -220,7 +275,7 @@ elif [[ -f ".clauditorc" ]]; then
             if prompt_trust .clauditorc; then
                 set_trusted "$(pwd)" "$current_hash"
                 info "Configuration trusted."
-                CONFIG_TRUSTED=true
+                PROJECT_TRUSTED=true
             else
                 warn "Skipping .clauditorc. Running with defaults."
             fi
@@ -229,40 +284,40 @@ elif [[ -f ".clauditorc" ]]; then
             if prompt_retrust .clauditorc; then
                 set_trusted "$(pwd)" "$current_hash"
                 info "Configuration trusted."
-                CONFIG_TRUSTED=true
+                PROJECT_TRUSTED=true
             else
                 warn "Skipping .clauditorc. Running with defaults."
             fi
         else
             # Hash matches — trusted
-            CONFIG_TRUSTED=true
+            PROJECT_TRUSTED=true
         fi
 
         # Only load config if trusted
-        if [[ "$CONFIG_TRUSTED" == true ]]; then
-            CONFIG_IMAGE=$(jq -r '.image // empty' .clauditorc)
-            if [[ -n "$CONFIG_IMAGE" ]]; then
-                IMAGE_NAME="$CONFIG_IMAGE"
-                CONFIG_HAS_IMAGE=true
+        if [[ "$PROJECT_TRUSTED" == true ]]; then
+            PROJECT_IMAGE=$(jq -r '.image // empty' .clauditorc)
+            if [[ -n "$PROJECT_IMAGE" ]]; then
+                IMAGE_NAME="$PROJECT_IMAGE"
+                IMAGE_SOURCE="project"
             fi
 
             while IFS= read -r vol; do
                 validate_volume "$vol"
-                CONFIG_VOLUMES+=("-v" "$vol")
-                CONFIG_VOLUME_SPECS+=("$vol")
+                PROJECT_VOLUMES+=("-v" "$vol")
+                PROJECT_VOLUME_SPECS+=("$vol")
             done < <(jq -r '(.volumes // [])[]' .clauditorc)
 
             while IFS= read -r arg; do
-                CONFIG_CLAUDE_ARGS+=("$arg")
+                PROJECT_CLAUDE_ARGS+=("$arg")
             done < <(jq -r '(.claude_args // [])[]' .clauditorc)
         fi
     fi
 fi
 
 # Parse claudito-specific arguments
-ADDITIONAL_VOLUMES=()
+CLI_VOLUMES=()
 CLI_VOLUME_SPECS=()
-CLAUDE_ARGS=()
+CLI_CLAUDE_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -275,16 +330,21 @@ while [[ $# -gt 0 ]]; do
                 error "Error: --image requires an argument (e.g., --image my-claudito:latest)"
                 exit 1
             fi
-            if [[ "$CONFIG_HAS_IMAGE" == true ]]; then
+            if [[ "$IMAGE_SOURCE" == "project" ]]; then
                 error "Error: --image conflicts with 'image' in .clauditorc"
                 error "Set the image in .clauditorc or on the command line, not both."
                 exit 1
             fi
             IMAGE_NAME="$2"
+            IMAGE_SOURCE="cli"
             shift 2
             ;;
         --no-config)
             NO_CONFIG=true
+            shift
+            ;;
+        --no-project-config)
+            NO_PROJECT_CONFIG=true
             shift
             ;;
         --volume|-V)
@@ -293,7 +353,7 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             validate_volume "$2"
-            ADDITIONAL_VOLUMES+=("-v" "$2")
+            CLI_VOLUMES+=("-v" "$2")
             CLI_VOLUME_SPECS+=("$2")
             shift 2
             ;;
@@ -311,7 +371,8 @@ while [[ $# -gt 0 ]]; do
             echo "  -V, --volume HOST:CONTAINER[:OPTIONS]"
             echo "                          Mount additional volume (can be used multiple times)"
             echo "                          Example: --volume /host/data:/container/data:ro"
-            echo "  --no-config             Ignore .clauditorc even if present"
+            echo "  --no-config             Ignore all config (global and project .clauditorc)"
+            echo "  --no-project-config     Ignore project .clauditorc only, still load global config"
             echo ""
             echo "Subcommands:"
             echo "  trust                   Trust the .clauditorc in the current directory"
@@ -342,25 +403,34 @@ while [[ $# -gt 0 ]]; do
             echo "    ~/.config/claudito/trusted.json"
             echo ""
             echo "  Use 'claudito trust' to pre-trust a config without being prompted."
+            echo ""
+            echo "Global Configuration:"
+            echo "  Place a config.json at ~/.config/claudito/config.json for personal defaults."
+            echo "  Uses the same JSON format as .clauditorc. Loaded before project config."
+            echo "  Project .clauditorc overrides global settings where there's a conflict."
+            echo ""
+            echo "  Respects \$XDG_CONFIG_HOME if set."
+            echo ""
+            echo "  No trust prompt needed — the global config is in your own config directory."
             exit 0
             ;;
         --)
             # Stop parsing claudito options
             shift
-            CLAUDE_ARGS+=("$@")
+            CLI_CLAUDE_ARGS+=("$@")
             break
             ;;
         *)
             # Pass all remaining arguments to Claude
-            CLAUDE_ARGS+=("$@")
+            CLI_CLAUDE_ARGS+=("$@")
             break
             ;;
     esac
 done
 
-# Merge .clauditorc settings with CLI arguments
-ADDITIONAL_VOLUMES=("${CONFIG_VOLUMES[@]}" "${ADDITIONAL_VOLUMES[@]}")
-CLAUDE_ARGS=("${CONFIG_CLAUDE_ARGS[@]}" "${CLAUDE_ARGS[@]}")
+# Merge all config layers: global + project + CLI
+ALL_VOLUMES=("${GLOBAL_VOLUMES[@]}" "${PROJECT_VOLUMES[@]}" "${CLI_VOLUMES[@]}")
+ALL_CLAUDE_ARGS=("${GLOBAL_CLAUDE_ARGS[@]}" "${PROJECT_CLAUDE_ARGS[@]}" "${CLI_CLAUDE_ARGS[@]}")
 
 # Display version
 info "Claudito version $VERSION"
@@ -402,9 +472,12 @@ fi
 CURRENT_DIR="$(pwd)"
 
 # Display launch summary
-if [[ ${#CONFIG_VOLUME_SPECS[@]} -gt 0 || ${#CLI_VOLUME_SPECS[@]} -gt 0 ]]; then
+if [[ ${#GLOBAL_VOLUME_SPECS[@]} -gt 0 || ${#PROJECT_VOLUME_SPECS[@]} -gt 0 || ${#CLI_VOLUME_SPECS[@]} -gt 0 ]]; then
     info "Extra volumes:"
-    for spec in "${CONFIG_VOLUME_SPECS[@]}"; do
+    for spec in "${GLOBAL_VOLUME_SPECS[@]}"; do
+        info "  $spec (from global config)"
+    done
+    for spec in "${PROJECT_VOLUME_SPECS[@]}"; do
         info "  $spec (from .clauditorc)"
     done
     for spec in "${CLI_VOLUME_SPECS[@]}"; do
@@ -412,9 +485,23 @@ if [[ ${#CONFIG_VOLUME_SPECS[@]} -gt 0 || ${#CLI_VOLUME_SPECS[@]} -gt 0 ]]; then
     done
 fi
 
-if [[ ${#CLAUDE_ARGS[@]} -gt 0 ]]; then
+if [[ ${#ALL_CLAUDE_ARGS[@]} -gt 0 ]]; then
     formatted_args=""
-    for arg in "${CLAUDE_ARGS[@]}"; do
+    for arg in "${GLOBAL_CLAUDE_ARGS[@]}"; do
+        if [[ "$arg" == *skip-permissions* ]]; then
+            formatted_args+="${YELLOW}${BOLD}⚠ ${arg} ⚠${NC} "
+        else
+            formatted_args+="$arg "
+        fi
+    done
+    for arg in "${PROJECT_CLAUDE_ARGS[@]}"; do
+        if [[ "$arg" == *skip-permissions* ]]; then
+            formatted_args+="${YELLOW}${BOLD}⚠ ${arg} ⚠${NC} "
+        else
+            formatted_args+="$arg "
+        fi
+    done
+    for arg in "${CLI_CLAUDE_ARGS[@]}"; do
         if [[ "$arg" == *skip-permissions* ]]; then
             formatted_args+="${YELLOW}${BOLD}⚠ ${arg} ⚠${NC} "
         else
@@ -437,7 +524,7 @@ exec docker run \
     --cap-add=NET_BIND_SERVICE \
     -v "$CURRENT_DIR:$WORK_DIR" \
     -v "$VOLUME_NAME:$CONTAINER_HOME_DIR" \
-    "${ADDITIONAL_VOLUMES[@]}" \
+    "${ALL_VOLUMES[@]}" \
     -w "$WORK_DIR" \
     "$IMAGE_NAME" \
-    "${CLAUDE_ARGS[@]}"
+    "${ALL_CLAUDE_ARGS[@]}"
