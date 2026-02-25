@@ -1,0 +1,9 @@
+# Raw data downloads (re-downloadable via download_data.sh)
+data/qcew/
+data/oesm*/
+data/oe.*
+data/oews_*_national.csv
+data/*.zip
+
+# Keep the AIOE data appendix (small, from GitHub)
+!data/AIOE_DataAppendix.xlsx
